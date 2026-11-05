@@ -37,9 +37,9 @@ Use `action=status` to poll and `action=result` to read the outcome.
 | `action` | `start` \| `status` \| `result` \| `cancel`, default `start` | Dispatch |
 | `prompt` | string, required for `start` | Passed to agy unchanged (`-p`) |
 | `jobID` | string, required for `status`/`result`/`cancel` | ID returned by `start` |
-| `model` | string | Free-form ID from `agy models`; an unknown ID triggers one throttled refresh, then an error. Omitted: `options.defaultModel`, then agy's default |
+| `model` | string | Free-form ID from `agy models`; an unknown ID triggers one throttled refresh, then an error. Omitted: `options.complexModel` when `effort` is high/xhigh/max, otherwise `options.defaultModel`, then agy's default |
 | `mode` | `plan` \| `accept-edits` \| `auto` | Defaults to `options.defaultMode` (`plan`) |
-| `effort` | `low` \| `medium` \| `high` \| `xhigh` \| `max` | Optional `--effort` |
+| `effort` | `low` \| `medium` \| `high` \| `xhigh` \| `max` | Optional `--effort`; high/xhigh/max also switch to `options.complexModel` |
 | `conversation` | string | Resume an exact agy conversation (`--conversation`) |
 | `continue` | boolean | Resume agy's most recent conversation (`-c`); mutual exclusion with `conversation` |
 
@@ -90,6 +90,8 @@ deleted by the plugin.
       "package": "./plugins/agy",
       "options": {
         "defaultMode": "plan",
+        "defaultModel": "gemini-3.8-flash-high",
+        "complexModel": "gemini-4-argon-medium",
         "maxConcurrent": 2,
         "timeoutMinutes": 10,
         "outputDir": ".agy-out",
@@ -101,8 +103,11 @@ deleted by the plugin.
 }
 ```
 
-`defaultModel` is optional. If it is set but not present in `agy models`, the plugin warns and lets
-agy choose. Non-`plan` modes call `ctx.permission.assert` first; if permission is denied, no job is
+`defaultModel` and `complexModel` are optional. If a configured ID is not in `agy models`, the
+plugin warns and ignores it, so the next candidate (or agy) chooses. This repo sets
+`gemini-3.8-flash-high` for routine work and `gemini-4-argon-medium` for complex work: the caller
+omits `model` and passes `effort: "high"` (or higher) to escalate, and an explicit `model` always
+wins. Non-`plan` modes call `ctx.permission.assert` first; if permission is denied, no job is
 created.
 
 `notifyOnComplete: false` turns off the synthetic wake-up: the job still records its state and
@@ -120,8 +125,9 @@ node scripts/smoke.mjs
 
 It covers `done`, `degraded`, `timed_out` and `cancelled` (both confirming the process is really
 dead), `failed` for a non-zero exit / invalid JSON / bad status, argv mapping including
-`conversation` vs `continue`, model parsing, the tail-only log read, job retention, orphan
-reconciliation, the notification metadata, the silent mode, and the cancel refusals.
+`conversation` vs `continue`, model parsing, model routing (effort → `complexModel`), the
+tail-only log read, job retention, orphan reconciliation, the notification metadata, the silent
+mode, and the cancel refusals.
 
 One real agy turn, when you want to spend quota:
 

@@ -20,7 +20,7 @@ import {
 } from "../plugins/agy/runner.ts"
 import { isModelsCacheStale, parseModelsOutput } from "../plugins/agy/models.ts"
 import { pruneJobs, reconcileOrphans, saveJob } from "../plugins/agy/jobs.ts"
-import plugin from "../plugins/agy/index.ts"
+import plugin, { resolveModelChoice } from "../plugins/agy/index.ts"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(HERE, "..")
@@ -616,7 +616,28 @@ await test("cancel refuses unowned jobs and reports finished ones", async () => 
   assert.match(output.content, /Nothing to cancel/)
 })
 
-// 11. Optional real agy run.
+// 11. Model routing: high effort opts into complexModel, otherwise the default.
+await test("effort high selects complexModel, otherwise defaultModel", async () => {
+  const state = { modelIDs: ["model-a", "model-b"], warnedModels: new Set() }
+  const options = { defaultModel: "model-a", complexModel: "model-b" }
+
+  assert.equal(resolveModelChoice(state, options, undefined), "model-a")
+  assert.equal(resolveModelChoice(state, options, "low"), "model-a")
+  assert.equal(resolveModelChoice(state, options, "medium"), "model-a")
+  assert.equal(resolveModelChoice(state, options, "high"), "model-b")
+  assert.equal(resolveModelChoice(state, options, "xhigh"), "model-b")
+  assert.equal(resolveModelChoice(state, options, "max"), "model-b")
+
+  // A stale/unknown complexModel must not block the start: fall through to the
+  // default and warn once per configured id.
+  state.modelIDs = ["model-a"]
+  assert.equal(resolveModelChoice(state, options, "high"), "model-a")
+  assert.equal(state.warnedModels.size, 1)
+  assert.equal(resolveModelChoice(state, options, "high"), "model-a")
+  assert.equal(state.warnedModels.size, 1)
+})
+
+// 12. Optional real agy run.
 if (process.env.AGY_SMOKE_REAL === "1") {
   await test("real agy returns a response", async () => {
     const jobID = `smoke-real-${Date.now().toString(36)}`

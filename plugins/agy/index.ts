@@ -33,6 +33,8 @@ import {
 
 const MODES: AgyMode[] = ["plan", "accept-edits", "auto"]
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+/** Efforts that switch a start to `options.complexModel`. */
+const COMPLEX_EFFORTS = ["high", "xhigh", "max"]
 
 const DEFAULT_OPTIONS = {
   defaultMode: "plan" as AgyMode,
@@ -50,11 +52,14 @@ const TOOL_DESCRIPTION = `Run the local Antigravity CLI (agy) as a background jo
 
 action="start" (default) spawns agy, returns a jobID immediately, and (unless options.notifyOnComplete is false) delivers the result later as a synthetic message. action="status" shows the state and the last 20 log lines. action="result" returns the final response (first 4000 characters), usage, denied actions and the full JSON path. action="cancel" kills the process tree of a running job and marks it cancelled.
 
-agy defaults to plan mode (read-only). Pass mode="accept-edits" or mode="auto" to allow edits; that asks for permission first. Write prompt like a task for a colleague: state the goal, the files involved, and what done looks like. Do not automatically submit the same task again after a completion notification.`
+agy defaults to plan mode (read-only). Pass mode="accept-edits" or mode="auto" to allow edits; that asks for permission first. Write prompt like a task for a colleague: state the goal, the files involved, and what done looks like. Do not automatically submit the same task again after a completion notification.
+
+Model routing: omit model for routine work (lookups, small edits, summaries) and agy uses the configured default. For a complex task — multi-file refactors, architecture decisions, hard debugging, long analysis — set effort="high" (or xhigh/max): that automatically selects the configured complex model. Pass model only to override the routing.`
 
 type PluginState = {
   modelIDs: string[]
-  warnedDefaultModel: boolean
+  /** Config keys already warned about, so a bad id warns once, not per start. */
+  warnedModels: Set<string>
 }
 
 type Options = {
@@ -65,6 +70,8 @@ type Options = {
   modelCacheTtlHours: number
   notifyOnComplete: boolean
   defaultModel?: string
+  /** Used when `effort` is high, xhigh or max. */
+  complexModel?: string
 }
 
 /** A running job and its handle, kept together so `action=cancel` can reach it. */
@@ -103,6 +110,7 @@ function normalizeOptions(raw: unknown): Options {
         ? source.notifyOnComplete
         : DEFAULT_OPTIONS.notifyOnComplete,
     defaultModel: asString(source.defaultModel),
+    complexModel: asString(source.complexModel),
   }
 }
 
@@ -123,27 +131,47 @@ function readJobResult(job: JobRecord) {
   return readResultFile(dirname(job.paths.json), job.id)
 }
 
-function resolveDefaultModel(state: PluginState, options: Options): string | undefined {
-  if (!options.defaultModel) return undefined
-  if (state.modelIDs.length > 0 && !state.modelIDs.includes(options.defaultModel)) {
-    if (!state.warnedDefaultModel) {
-      console.warn(
-        `[agy] options.defaultModel "${options.defaultModel}" is not in \`agy models\`; falling back to agy's default`
-      )
-      state.warnedDefaultModel = true
+function usableModel(state: PluginState, id: string, label: string): string | undefined {
+  if (state.modelIDs.length > 0 && !state.modelIDs.includes(id)) {
+    const key = `${label}:${id}`
+    if (!state.warnedModels.has(key)) {
+      console.warn(`[agy] options.${label} "${id}" is not in \`agy models\`; ignoring it`)
+      state.warnedModels.add(key)
     }
     return undefined
   }
-  return options.defaultModel
+  return id
 }
 
-function buildSchema(state: PluginState): Record<string, unknown> {
+/**
+ * Picks the model for a start. An explicit `model` bypasses this entirely.
+ * `complexModel` wins for high effort (and above); otherwise `defaultModel`
+ * applies. An unknown configured id is ignored rather than failing the start,
+ * and falls through to the next candidate.
+ */
+export function resolveModelChoice(
+  state: PluginState,
+  options: Options,
+  effort: string | undefined
+): string | undefined {
+  if (options.complexModel && effort && COMPLEX_EFFORTS.includes(effort)) {
+    const complex = usableModel(state, options.complexModel, "complexModel")
+    if (complex) return complex
+  }
+  if (options.defaultModel) return usableModel(state, options.defaultModel, "defaultModel")
+  return undefined
+}
+
+function buildSchema(state: PluginState, options: Options): Record<string, unknown> {
   // Free-form on purpose: an `enum` would reject a model that agy added after
   // the cache was written, before `start` runs and can refresh the list.
   const known = state.modelIDs.length > 0 ? ` Known IDs: ${state.modelIDs.join(", ")}.` : ""
+  const fallback = options.defaultModel
+    ? ` Omit for the configured default (${options.defaultModel})${options.complexModel ? `; high effort or above selects ${options.complexModel}` : ""}. Pass model to override both.`
+    : ""
   const model = {
     type: "string",
-    description: `agy model ID from \`agy models\`.${known} An unknown ID triggers one refresh, then fails.`,
+    description: `agy model ID from \`agy models\`.${known}${fallback} An unknown ID triggers one refresh, then fails.`,
   }
 
   return {
@@ -165,7 +193,13 @@ function buildSchema(state: PluginState): Record<string, unknown> {
         enum: MODES,
         description: "plan is read-only; accept-edits/auto ask for permission first.",
       },
-      effort: { type: "string", enum: EFFORTS },
+      effort: {
+        type: "string",
+        enum: EFFORTS,
+        description: options.complexModel
+          ? `Reasoning effort. high, xhigh and max also select the configured complex model (${options.complexModel}).`
+          : "Reasoning effort for this session.",
+      },
       conversation: {
         type: "string",
         description: "Exact conversation ID to resume; mutually exclusive with continue.",
@@ -384,7 +418,7 @@ async function startJob(
   }
 
   const explicitModel = asString(input.model)
-  let model = explicitModel ?? resolveDefaultModel(state, options)
+  let model = explicitModel ?? resolveModelChoice(state, options, effort)
 
   const running = Array.from(active.values())
     .map((entry) => entry.job)
@@ -545,7 +579,7 @@ export default {
     const outputDir = isAbsolute(options.outputDir)
       ? options.outputDir
       : join(directory, options.outputDir)
-    const state: PluginState = { modelIDs: [], warnedDefaultModel: false }
+    const state: PluginState = { modelIDs: [], warnedModels: new Set() }
     const active = new Map<string, ActiveJob>()
 
     console.log(`[agy] setup directory=${directory} output=${outputDir}`)
@@ -608,7 +642,7 @@ export default {
       editor.add({
         name: "agy",
         description: TOOL_DESCRIPTION,
-        input: buildSchema(state),
+        input: buildSchema(state, options),
         execute: async (input: Record<string, unknown>, context: any) => {
           const action = asString(input?.action) ?? "start"
 

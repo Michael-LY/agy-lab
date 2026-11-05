@@ -24,7 +24,10 @@ uses a plain object (`export default { id, setup }`) rather than `Plugin.define`
 - `jobs.ts` — `jobs/<jobID>` records, 50-finished-job retention, orphan reconciliation.
 
 Options (`opencode.json`): `defaultMode`, `maxConcurrent`, `timeoutMinutes`, `outputDir`,
-`modelCacheTtlHours`, `notifyOnComplete`, optional `defaultModel`. Keep v1 scope: no subagents,
+`modelCacheTtlHours`, `notifyOnComplete`, optional `defaultModel`, optional `complexModel`. This
+repo sets `defaultModel: "gemini-3.8-flash-high"` and `complexModel: "gemini-4-argon-medium"`;
+routine calls omit `model`, and `effort: "high"` (or higher) switches to the complex model. An
+explicit `model` always wins. Keep v1 scope: no subagents,
 slash commands, queueing, `jsonSchema`, `addDir`/`directory` overrides, `agent`/`sandbox`
 passthrough, TUI panels, or quota display.
 

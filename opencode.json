@@ -5,6 +5,8 @@
       "package": "./plugins/agy",
       "options": {
         "defaultMode": "plan",
+        "defaultModel": "gemini-3.8-flash-high",
+        "complexModel": "gemini-4-argon-medium",
         "maxConcurrent": 2,
         "timeoutMinutes": 10,
         "outputDir": ".agy-out",
