@@ -8,7 +8,8 @@
         "maxConcurrent": 2,
         "timeoutMinutes": 10,
         "outputDir": ".agy-out",
-        "modelCacheTtlHours": 24
+        "modelCacheTtlHours": 24,
+        "notifyOnComplete": true
       }
     }
   ]

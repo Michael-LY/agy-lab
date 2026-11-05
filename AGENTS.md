@@ -12,19 +12,21 @@ uses a plain object (`export default { id, setup }`) rather than `Plugin.define`
 `@opencode/plugin` is off-limits here.
 
 - `index.ts` — registers the single `agy` tool, validates `action` / `prompt` / `jobID`, calls
-  `ctx.permission.assert` for non-`plan` modes, persists jobs, and injects synthetic completion
-  messages with `delivery: "queue"`.
+  `ctx.permission.assert` for non-`plan` modes, persists jobs, injects synthetic completion
+  messages with `delivery: "queue"` (suppressed by `notifyOnComplete: false`), refreshes the model
+  list once on an unknown `model`, and serves `action=cancel` from the in-memory job handles.
 - `runner.ts` — builds argv, spawns agy without a shell, streams stdout/stderr into the output
-  directory, enforces the timeout, and kills the process tree. Uses only erasable TypeScript so
-  Node can import it directly from `scripts/smoke.mjs`.
+  directory, writes `[agy-runner]` start/exit lines into the log, enforces the timeout, kills the
+  process tree (timeout or cancel), and reads status tails from the last 64 KB only. Uses only
+  erasable TypeScript so Node can import it directly from `scripts/smoke.mjs`.
 - `models.ts` — reads `ctx.storage` key `models/cache`, refreshes via `agy models` (5 s timeout),
   and falls back to the old cache or a free-string `model` parameter.
 - `jobs.ts` — `jobs/<jobID>` records, 50-finished-job retention, orphan reconciliation.
 
 Options (`opencode.json`): `defaultMode`, `maxConcurrent`, `timeoutMinutes`, `outputDir`,
-`modelCacheTtlHours`, optional `defaultModel`. Keep v1 scope: no subagents, slash commands,
-cancellation, queueing, `jsonSchema`, `addDir`/`directory` overrides, `agent`/`sandbox` passthrough,
-TUI panels, or quota display.
+`modelCacheTtlHours`, `notifyOnComplete`, optional `defaultModel`. Keep v1 scope: no subagents,
+slash commands, queueing, `jsonSchema`, `addDir`/`directory` overrides, `agent`/`sandbox`
+passthrough, TUI panels, or quota display.
 
 ## Calling `agy`
 

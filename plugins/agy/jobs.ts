@@ -5,7 +5,7 @@
 // never deleted by the plugin.
 
 import { randomBytes } from "node:crypto"
-import { readResultFile, type JobPaths, type JobState, type Usage } from "./runner.ts"
+import { formatDenied, readResultFile, type JobPaths, type JobState, type Usage } from "./runner.ts"
 
 export const JOBS_PREFIX = "jobs/"
 export const MAX_JOBS = 50
@@ -122,7 +122,7 @@ function mergeFromResultFile(job: JobRecord, fileJob: unknown): boolean {
   if (typeof source.endedAt === "number") job.endedAt = source.endedAt
   if (typeof source.durationMs === "number") job.durationMs = source.durationMs
   if (source.usage && typeof source.usage === "object") job.usage = source.usage
-  if (Array.isArray(source.denied)) job.denied = source.denied.map(String)
+  if (Array.isArray(source.denied)) job.denied = source.denied.map(formatDenied)
   if (typeof source.error === "string") job.error = source.error
   if (typeof source.conversationID === "string") job.conversationID = source.conversationID
   if (typeof source.numTurns === "number") job.numTurns = source.numTurns

@@ -6,7 +6,7 @@
 // AGY_SMOKE_REAL=1) does not spend Antigravity quota.
 
 import assert from "node:assert/strict"
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -14,6 +14,7 @@ import {
   buildArgs,
   jobPaths,
   readResultFile,
+  readTail,
   runJob,
   writeResultFile,
 } from "../plugins/agy/runner.ts"
@@ -133,6 +134,12 @@ await test("ok result is done and writes log/err/json", async () => {
   for (const path of [result.paths.log, result.paths.err, result.paths.json]) {
     assert.ok(existsSync(path), `missing ${path}`)
   }
+
+  // The runner adds its own edges to the log, so status is never empty.
+  const log = readFileSync(result.paths.log, "utf8")
+  assert.match(log, /\[agy-runner\] started pid=\d+/)
+  assert.match(log, /\[agy-runner\] exit code=0 duration=\d+ms/)
+  assert.match(log, /fake agy response/)
   const file = JSON.parse(readFileSync(result.paths.json, "utf8"))
   assert.equal(file.agy.status, "SUCCESS")
   assert.equal(file.agy.response, "fake agy response\nsecond line")
@@ -147,20 +154,23 @@ await test("ok result is done and writes log/err/json", async () => {
 })
 
 // 2. empty response with denied actions.
-await test("empty response + denied_actions is degraded", async () => {
+await test("empty response + denied_actions is degraded and readable", async () => {
   const { result } = await runFake("empty-denied")
   assert.equal(result.state, "degraded")
-  assert.deepEqual(result.deniedActions, ["write_file"])
-  assert.match(result.error, /denied actions: write_file/)
+  // agy sends objects; flattening them with String() gives "[object Object]".
+  assert.deepEqual(result.deniedActions, ["RunCommand"])
+  assert.match(result.error, /denied actions: RunCommand/)
+  assert.doesNotMatch(result.error, /\[object Object\]/)
 })
 
 // 3. hard timeout kills the process tree.
-await test("timeout is timed_out and the child is dead", async () => {
+await test("timeout is timed_out and the whole process tree is dead", async () => {
   const pidFile = join(WORK, "timeout.pid")
+  const childPidFile = join(WORK, "timeout-child.pid")
   const started = Date.now()
   const { result } = await runFake("timeout", {
     timeoutMs: 1200,
-    env: { FAKE_AGY_PID_FILE: pidFile },
+    env: { FAKE_AGY_PID_FILE: pidFile, FAKE_AGY_CHILD_PID_FILE: childPidFile },
   })
   const elapsed = Date.now() - started
 
@@ -172,6 +182,77 @@ await test("timeout is timed_out and the child is dead", async () => {
   const pid = Number(readFileSync(pidFile, "utf8"))
   assert.ok(Number.isInteger(pid) && pid > 0)
   assert.equal(await waitUntilDead(pid), true, `pid ${pid} is still alive`)
+
+  // The fake spawns a grandchild: a plain child.kill() would leave it behind.
+  assert.ok(existsSync(childPidFile), "fake agy did not write its grandchild pid")
+  const childPid = Number(readFileSync(childPidFile, "utf8"))
+  assert.equal(await waitUntilDead(childPid), true, `grandchild ${childPid} is still alive`)
+})
+
+// 3b. cancel kills the process tree and reports its own state.
+await test("cancel kills the child and reports cancelled", async () => {
+  const pidFile = join(WORK, "cancel.pid")
+  const childPidFile = join(WORK, "cancel-child.pid")
+  const handle = runJob({
+    jobID: `cancel-${Date.now().toString(36)}`,
+    prompt: "cancel me",
+    directory: ROOT,
+    outputDir: WORK,
+    timeoutMinutes: 10,
+    launcher: { command: process.execPath, args: [FAKE] },
+    env: {
+      FAKE_AGY_MODE: "timeout",
+      FAKE_AGY_PID_FILE: pidFile,
+      FAKE_AGY_CHILD_PID_FILE: childPidFile,
+    },
+  })
+
+  const started = Date.now()
+  while (!existsSync(childPidFile) && Date.now() - started < 5000) {
+    await new Promise((resolveNext) => setTimeout(resolveNext, 50))
+  }
+  assert.ok(existsSync(pidFile), "fake agy did not write its pid file")
+  assert.ok(existsSync(childPidFile), "fake agy did not write its grandchild pid")
+
+  assert.equal(handle.kill(), true)
+  const result = await handle.done
+
+  assert.equal(result.state, "cancelled", result.error)
+  assert.match(result.error, /cancelled/)
+  const pid = Number(readFileSync(pidFile, "utf8"))
+  const childPid = Number(readFileSync(childPidFile, "utf8"))
+  assert.equal(await waitUntilDead(pid), true, `pid ${pid} is still alive`)
+  assert.equal(await waitUntilDead(childPid), true, `grandchild ${childPid} is still alive`)
+
+  // A second cancel is a truthful no-op, not another "cancelled".
+  assert.equal(handle.kill(), false)
+})
+
+// 3c. readTail must read a window, not the whole file.
+await test("readTail reads only the requested window", () => {
+  const path = join(WORK, "big.log")
+  const line = "x".repeat(1000)
+  writeFileSync(path, `${line}\n`.repeat(2000) + "last-line\n")
+
+  const tail = readTail(path, 1000, 4096)
+  const lines = tail.split("\n")
+  assert.ok(lines.length <= 5, `window returned ${lines.length} lines`)
+  assert.equal(lines.at(-1), "last-line")
+  assert.ok(lines.every((entry) => entry === "last-line" || entry === line), "window returned foreign text")
+
+  // A cut multi-byte character must not reach the caller as U+FFFD.
+  const multibyte = join(WORK, "multibyte.log")
+  writeFileSync(multibyte, `${"é".repeat(4000)}\ntail\n`)
+  const multibyteTail = readTail(multibyte, 5, 64)
+  assert.equal(multibyteTail, "tail")
+  assert.doesNotMatch(multibyteTail, /\uFFFD/)
+
+  // CRLF is split correctly.
+  const crlf = join(WORK, "crlf.log")
+  writeFileSync(crlf, "a\r\nb\r\nc\r\n")
+  assert.equal(readTail(crlf, 2), "b\nc")
+
+  assert.equal(readTail(join(WORK, "missing.log")), "")
 })
 
 // 4. non-zero exit, invalid JSON and non-SUCCESS status.
@@ -299,7 +380,16 @@ await test("reconcileOrphans recovers a finished file and marks the rest orphane
   const recovered = baseJob("recovered", "running", now, jobPaths(WORK, "recovered"))
   writeResultFile(
     recovered.paths.json,
-    { id: "recovered", state: "done", endedAt: now + 10, durationMs: 10 },
+    {
+      id: "recovered",
+      state: "done",
+      endedAt: now + 10,
+      durationMs: 10,
+      conversationID: "conv-recovered",
+      numTurns: 2,
+      // The runner writes the same shape; objects must survive the merge.
+      denied: [{ action: "command", display_name: "RunCommand" }],
+    },
     { status: "SUCCESS", response: "from file" }
   )
   await saveJob(storage, recovered)
@@ -312,6 +402,14 @@ await test("reconcileOrphans recovers a finished file and marks the rest orphane
   assert.equal(outcome.orphaned.length, 1)
   assert.equal(storage.data.get("jobs/recovered").state, "done")
   assert.equal(storage.data.get("jobs/orphan").state, "orphaned")
+
+  // The preliminary file is the only witness after a reload; nothing in it
+  // may be lost or stringified on the way back into the record.
+  const merged = storage.data.get("jobs/recovered")
+  assert.deepEqual(merged.denied, ["RunCommand"])
+  assert.equal(merged.conversationID, "conv-recovered")
+  assert.equal(merged.numTurns, 2)
+  assert.equal(merged.durationMs, 10)
 })
 
 // 8. Plugin setup registers exactly one tool with cached model enum.
@@ -338,8 +436,11 @@ await test("plugin setup registers one agy tool with the cached model enum", asy
 
   assert.equal(tools.length, 1)
   assert.equal(tools[0].name, "agy")
-  assert.deepEqual(tools[0].input.properties.action.enum, ["start", "status", "result"])
-  assert.deepEqual(tools[0].input.properties.model.enum, ["model-a", "model-b"])
+  assert.deepEqual(tools[0].input.properties.action.enum, ["start", "status", "result", "cancel"])
+  // Free-form on purpose: a new agy model must not wait for a restart.
+  assert.equal(tools[0].input.properties.model.type, "string")
+  assert.equal(tools[0].input.properties.model.enum, undefined)
+  assert.match(tools[0].input.properties.model.description, /model-a, model-b/)
   assert.deepEqual(tools[0].input.properties.mode.enum, ["plan", "accept-edits", "auto"])
 
   const context = { sessionID: "session-1", agent: "build", messageID: "msg-1", id: "call-1" }
@@ -381,7 +482,7 @@ await test("plugin setup registers one agy tool with the cached model enum", asy
     {
       status: "SUCCESS",
       response: "",
-      denied_actions: ["write_file"],
+      denied_actions: [{ action: "write", display_name: "write_file" }],
       conversation_id: "conv-seeded",
       num_turns: 2,
       usage: { input_tokens: 1, output_tokens: 0, thinking_tokens: 0, cache_read_tokens: 0, total_tokens: 1 },
@@ -392,13 +493,130 @@ await test("plugin setup registers one agy tool with the cached model enum", asy
   assert.match(resultOutput.content, /state: degraded/)
   assert.match(resultOutput.content, /conversation_id: conv-seeded/)
   assert.match(resultOutput.content, /Retry with mode=plan/)
+  assert.match(resultOutput.content, /denied_actions: write_file/)
+  assert.doesNotMatch(resultOutput.content, /\[object Object\]/)
 
   const statusOutput = await tools[0].execute({ action: "status", jobID: seededID }, context)
   assert.match(statusOutput.content, /state: degraded/)
   assert.match(statusOutput.content, /log tail/)
 })
 
-// 9. Optional real agy run.
+// 9. Completion notifications: enough metadata for a one-round follow-up, and
+// the silent switch.
+function makePluginCtx({ storage, options = {}, synthetic = [] }) {
+  const tools = []
+  return {
+    tools,
+    synthetic,
+    ctx: {
+      options: { defaultMode: "plan", outputDir: WORK, ...options },
+      location: { directory: ROOT },
+      storage,
+      tool: {
+        transform: async (callback) => {
+          callback({ add: (tool) => tools.push(tool) })
+        },
+        reload: async () => {},
+      },
+      session: {
+        synthetic: async (message) => {
+          synthetic.push(message)
+        },
+      },
+      permission: { assert: async () => {} },
+    },
+  }
+}
+
+async function seedRunningJobWithResult(storage, id, sessionID = "session-1") {
+  const paths = jobPaths(WORK, id)
+  writeResultFile(
+    paths.json,
+    { id, state: "done", endedAt: Date.now(), durationMs: 10 },
+    {
+      status: "SUCCESS",
+      response: "notified response",
+      conversation_id: `conv-${id}`,
+      num_turns: 2,
+      usage: {
+        input_tokens: 5,
+        output_tokens: 6,
+        thinking_tokens: 1,
+        cache_read_tokens: 2,
+        total_tokens: 11,
+      },
+    }
+  )
+  await saveJob(storage, {
+    id,
+    sessionID,
+    directory: ROOT,
+    mode: "plan",
+    startedAt: Date.now() - 1000,
+    state: "running",
+    paths,
+    notified: false,
+  })
+}
+
+await test("completion notification carries conversation_id and usage", async () => {
+  const storage = makeStorage({ "models/cache": { ids: ["model-a"], fetchedAt: Date.now() } })
+  const jobID = `notify-${Date.now().toString(36)}`
+  await seedRunningJobWithResult(storage, jobID)
+
+  const { ctx, synthetic } = makePluginCtx({ storage })
+  await plugin.setup(ctx)
+
+  assert.equal(synthetic.length, 1)
+  const text = synthetic[0].text
+  assert.match(text, new RegExp(`conversation_id: conv-${jobID}`))
+  assert.match(text, /num_turns: 2/)
+  assert.match(text, /usage: input=5 output=6 thinking=1 cache_read=2 total=11/)
+  assert.match(text, new RegExp(`pass conversation="conv-${jobID}"`))
+  assert.equal(storage.data.get(`jobs/${jobID}`).notified, true)
+})
+
+await test("notifyOnComplete=false marks the job notified without a wake-up", async () => {
+  const storage = makeStorage({ "models/cache": { ids: ["model-a"], fetchedAt: Date.now() } })
+  const jobID = `silent-${Date.now().toString(36)}`
+  await seedRunningJobWithResult(storage, jobID)
+
+  const { ctx, synthetic } = makePluginCtx({ storage, options: { notifyOnComplete: false } })
+  await plugin.setup(ctx)
+
+  assert.equal(synthetic.length, 0)
+  const stored = storage.data.get(`jobs/${jobID}`)
+  assert.equal(stored.notified, true)
+  assert.equal(stored.state, "done")
+})
+
+// 10. Cancellation: only jobs this process owns can be killed.
+await test("cancel refuses unowned jobs and reports finished ones", async () => {
+  const storage = makeStorage({ "models/cache": { ids: ["model-a"], fetchedAt: Date.now() } })
+  const { ctx, tools } = makePluginCtx({ storage })
+  await plugin.setup(ctx)
+
+  const context = { sessionID: "session-1", agent: "build", messageID: "msg-1", id: "call-1" }
+
+  const orphanID = `orphan-${Date.now().toString(36)}`
+  await seedRunningJobWithResult(storage, orphanID) // running record, started after setup
+
+  await assert.rejects(
+    () => tools[0].execute({ action: "cancel", jobID: orphanID }, context),
+    /not running in this process/
+  )
+  await assert.rejects(
+    () => tools[0].execute({ action: "cancel", jobID: "nope" }, context),
+    /no job nope/
+  )
+
+  const doneID = `finished-${Date.now().toString(36)}`
+  await saveJob(storage, baseJob(doneID, "done", Date.now(), jobPaths(WORK, doneID)))
+  const output = await tools[0].execute({ action: "cancel", jobID: doneID }, context)
+  assert.match(output.content, /Nothing to cancel/)
+})
+
+// 11. Optional real agy run.
 if (process.env.AGY_SMOKE_REAL === "1") {
   await test("real agy returns a response", async () => {
     const jobID = `smoke-real-${Date.now().toString(36)}`

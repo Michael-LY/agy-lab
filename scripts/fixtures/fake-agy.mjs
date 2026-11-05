@@ -1,6 +1,7 @@
 // Fake `agy` used by scripts/smoke.mjs. It receives the same argv the real CLI
 // would get and switches on FAKE_AGY_MODE.
 
+import { spawn } from "node:child_process"
 import { writeFileSync } from "node:fs"
 
 const args = process.argv.slice(2)
@@ -42,7 +43,14 @@ switch (mode) {
     break
 
   case "empty-denied":
-    console.log(JSON.stringify({ ...base, response: "", denied_actions: ["write_file"] }))
+    // agy reports denied actions as objects, not strings; the fixture must too.
+    console.log(
+      JSON.stringify({
+        ...base,
+        response: "",
+        denied_actions: [{ action: "command", display_name: "RunCommand" }],
+      })
+    )
     break
 
   case "badstatus":
@@ -58,14 +66,25 @@ switch (mode) {
     console.log("this is not json")
     break
 
-  case "timeout":
+  case "timeout": {
     if (process.env.FAKE_AGY_PID_FILE) {
       writeFileSync(process.env.FAKE_AGY_PID_FILE, String(process.pid))
+    }
+    // A grandchild makes the difference between child.kill() and a real
+    // process-tree kill observable.
+    const grandchild = spawn(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)"],
+      { stdio: "ignore", windowsHide: true }
+    )
+    if (process.env.FAKE_AGY_CHILD_PID_FILE && grandchild.pid) {
+      writeFileSync(process.env.FAKE_AGY_CHILD_PID_FILE, String(grandchild.pid))
     }
     console.log("fake agy is working...")
     // Keep the process alive until the runner's hard kill.
     setTimeout(() => console.log("fake agy finished too late"), 60_000)
     break
+  }
 
   default:
     console.error(`unknown FAKE_AGY_MODE: ${mode}`)
