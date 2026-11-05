@@ -87,7 +87,8 @@ export type RunResult = {
 export type RunHandle = {
   pid: number | null
   done: Promise<RunResult>
-  kill: () => void
+  /** False when the job is already exiting; nothing was killed. */
+  kill: () => boolean
 }
 
 const MAX_STDOUT_BYTES = 8 * 1024 * 1024
@@ -98,6 +99,26 @@ const TAIL_BYTES = 64 * 1024
 /** Lines the runner appends itself, so `status` is not empty while agy is quiet. */
 export function heartbeat(line: string): string {
   return `[agy-runner] ${line}`
+}
+
+/**
+ * agy reports denied actions as objects (`{action, display_name}`), not
+ * strings. Flattening one with `String()` yields "[object Object]", which is
+ * exactly what the retry hint must never say.
+ */
+export function formatDenied(item: unknown): string {
+  if (typeof item === "string") return item
+  if (item && typeof item === "object") {
+    const record = item as Record<string, unknown>
+    if (typeof record.display_name === "string") return record.display_name
+    if (typeof record.action === "string") return record.action
+    try {
+      return JSON.stringify(item)
+    } catch {
+      return String(item)
+    }
+  }
+  return String(item)
 }
 
 export function stripAnsi(text: string): string {
@@ -270,7 +291,7 @@ export function runJob(input: RunInput): RunHandle {
     void endStream(errStream)
     return {
       pid: null,
-      kill: () => {},
+      kill: () => false,
       done: Promise.resolve({
         state: "failed",
         exitCode: null,
@@ -333,7 +354,7 @@ export function runJob(input: RunInput): RunHandle {
     const record = (agy && typeof agy === "object" ? agy : {}) as Record<string, unknown>
     const response = typeof record.response === "string" ? record.response : ""
     const deniedActions = Array.isArray(record.denied_actions)
-      ? record.denied_actions.map((item) => String(item))
+      ? record.denied_actions.map(formatDenied)
       : []
 
     let state: JobState = "failed"
@@ -408,7 +429,12 @@ export function runJob(input: RunInput): RunHandle {
           conversation: input.conversation,
           directory: input.directory,
           usage: result.usage,
-          deniedActions,
+          // `denied` plus the timing fields are what jobs.ts merges back into
+          // the record when a reload has to recover this file.
+          denied: deniedActions,
+          durationMs: result.durationMs,
+          conversationID: result.conversationID,
+          numTurns: result.numTurns,
           error,
           paths,
         },
@@ -426,7 +452,25 @@ export function runJob(input: RunInput): RunHandle {
     settled = true
     clearTimeout(timer)
     clearTimeout(killTimer)
-    void finish().then((result) => resolveDone(result))
+    finish()
+      .then((result) => resolveDone(result))
+      .catch((error: unknown) => {
+        // Without this the promise never resolves and the job holds a slot
+        // forever; the .catch in index.ts could never fire.
+        resolveDone({
+          state: "failed",
+          exitCode,
+          startedAt,
+          endedAt: Date.now(),
+          durationMs: Date.now() - startedAt,
+          response: "",
+          deniedActions: [],
+          error: `runner crashed while finishing: ${error instanceof Error ? error.message : String(error)}`,
+          agy: null,
+          pid: child.pid ?? null,
+          paths,
+        })
+      })
   }
 
   const timer = setTimeout(() => {
@@ -442,8 +486,17 @@ export function runJob(input: RunInput): RunHandle {
     settle()
   })
 
+  // `exit` fires before `close`: after it, the pid is gone and a kill would
+  // either be a no-op or hit a recycled pid.
+  let exited = false
+  child.on("exit", () => {
+    exited = true
+  })
+
   child.stdout?.on("data", (chunk: Buffer) => {
-    logStream.write(chunk)
+    // A forced settle (timeout/cancel fallback) already ended the stream; a
+    // late chunk would hit write-after-end and be lost silently anyway.
+    if (!settled) logStream.write(chunk)
     stdoutBytes += chunk.length
     if (stdoutBytes > MAX_STDOUT_BYTES) {
       stdoutOverflow = true
@@ -453,7 +506,7 @@ export function runJob(input: RunInput): RunHandle {
   })
 
   child.stderr?.on("data", (chunk: Buffer) => {
-    errStream.write(chunk)
+    if (!settled) errStream.write(chunk)
     stderrBytes += chunk.length
     if (stderrBytes <= MAX_STDERR_BYTES) stderrChunks.push(chunk)
     else stderrOverflow = true
@@ -476,13 +529,17 @@ export function runJob(input: RunInput): RunHandle {
     pid: child.pid ?? null,
     done,
     kill: () => {
-      if (settled) return
+      // Nothing to kill: the result is already being written, the child is
+      // gone, or the timeout path owns the tree. Reporting "cancelled" here
+      // would be a lie, so tell the caller it did not apply.
+      if (settled || exited || timedOut) return false
       cancelled = true
       clearTimeout(timer)
       clearTimeout(killTimer)
       killTree(child.pid ?? 0)
       // Same guard as the timeout path: resolve even if taskkill is ignored.
       killTimer = setTimeout(() => settle(), 2000)
+      return true
     },
   }
 }
@@ -501,13 +558,16 @@ export function readTail(path: string, lines = 20, maxBytes = TAIL_BYTES): strin
 
     const buffer = Buffer.allocUnsafe(length)
     const fd = openSync(path, "r")
+    let read = 0
     try {
-      readSync(fd, buffer, 0, length, start)
+      read = readSync(fd, buffer, 0, length, start)
     } finally {
       closeSync(fd)
     }
+    if (read <= 0) return ""
 
-    text = buffer.toString("utf8")
+    // Only the bytes actually read: allocUnsafe may hold older data.
+    text = buffer.subarray(0, read).toString("utf8")
     // When the window starts mid-file, the first line is a fragment: drop it.
     if (start > 0) {
       const newline = text.indexOf("\n")

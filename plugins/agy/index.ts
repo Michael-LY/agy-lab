@@ -7,6 +7,7 @@
 import { dirname, isAbsolute, join, resolve } from "node:path"
 
 import {
+  formatDenied,
   jobPaths,
   mapUsage,
   readResultFile,
@@ -157,7 +158,7 @@ function buildSchema(state: PluginState): Record<string, unknown> {
         type: "string",
         description: "Required for action=start. Passed to agy unchanged; write it like a task brief.",
       },
-      jobID: { type: "string", description: "Required for action=status and action=result." },
+      jobID: { type: "string", description: "Required for action=status, action=result and action=cancel." },
       model,
       mode: {
         type: "string",
@@ -237,7 +238,7 @@ function resultText(job: JobRecord): string {
         ? agy.duration_seconds
         : undefined
   const denied = Array.isArray(agy.denied_actions)
-    ? agy.denied_actions.map((item) => String(item))
+    ? agy.denied_actions.map(formatDenied)
     : (job.denied ?? [])
   const truncated = response.length > 4000 ? `${response.slice(0, 4000)}\n… (truncated; full response in ${job.paths.json})` : response
 
@@ -385,16 +386,6 @@ async function startJob(
   const explicitModel = asString(input.model)
   let model = explicitModel ?? resolveDefaultModel(state, options)
 
-  // The model list is free-form in the schema, so validate here. A miss may
-  // just mean agy added a model after the cache was written: refresh once.
-  if (explicitModel && state.modelIDs.length > 0 && !state.modelIDs.includes(explicitModel)) {
-    const known = await refreshModels(true)
-    if (known.length > 0 && !known.includes(explicitModel)) {
-      throw new Error(`agy: unknown model "${explicitModel}"; known IDs: ${known.join(", ")}`)
-    }
-    model = explicitModel
-  }
-
   const running = Array.from(active.values())
     .map((entry) => entry.job)
     .filter((job) => job.state === "running")
@@ -404,23 +395,8 @@ async function startJob(
     )
   }
 
-  if (mode !== "plan") {
-    await ctx.permission.assert({
-      sessionID: context?.sessionID,
-      agent: context?.agent,
-      source: {
-        type: "tool",
-        messageID: context?.messageID,
-        id: context?.id,
-      },
-      action: "agy",
-      resources: [directory],
-      save: [directory],
-    })
-  }
-
-  await pruneJobs(ctx.storage, 50)
-
+  // Reserve the slot before the next await. A permission prompt can wait on a
+  // human, and two parallel starts would otherwise both pass the check above.
   const id = newJobID()
   const job: JobRecord = {
     id,
@@ -436,13 +412,48 @@ async function startJob(
     paths: jobPaths(outputDir, id),
     notified: false,
   }
-
-  await saveJob(ctx.storage, job)
   const entry: ActiveJob = { job }
   active.set(id, entry)
 
+  // A denied permission must not leave a job behind: release the reservation
+  // and persist nothing.
+  if (mode !== "plan") {
+    try {
+      await ctx.permission.assert({
+        sessionID: context?.sessionID,
+        agent: context?.agent,
+        source: {
+          type: "tool",
+          messageID: context?.messageID,
+          id: context?.id,
+        },
+        action: "agy",
+        resources: [directory],
+        save: [directory],
+      })
+    } catch (error) {
+      active.delete(id)
+      throw error
+    }
+  }
+
+  // The model list is free-form in the schema, so validate here. A miss may
+  // just mean agy added a model after the cache was written: refresh once.
+  // Ordered after the concurrency gate so a doomed start does not spend it.
+  if (explicitModel && state.modelIDs.length > 0 && !state.modelIDs.includes(explicitModel)) {
+    const known = await refreshModels(true)
+    if (known.length > 0 && !known.includes(explicitModel)) {
+      active.delete(id)
+      throw new Error(`agy: unknown model "${explicitModel}"; known IDs: ${known.join(", ")}`)
+    }
+    model = explicitModel
+    job.model = model
+  }
+
   let handle: ReturnType<typeof runJob>
   try {
+    await pruneJobs(ctx.storage, 50)
+    await saveJob(ctx.storage, job)
     handle = runJob({
       jobID: id,
       prompt,
@@ -460,17 +471,26 @@ async function startJob(
     job.state = "failed"
     job.endedAt = Date.now()
     job.error = error instanceof Error ? error.message : String(error)
-    await saveJob(ctx.storage, job)
+    try {
+      await saveJob(ctx.storage, job)
+    } catch {
+      // The start already failed; a missing record is not worth a second error.
+    }
     throw error
   }
 
   entry.handle = handle
   job.pid = handle.pid
-  await saveJob(ctx.storage, job)
+  try {
+    await saveJob(ctx.storage, job)
+  } catch (error) {
+    // agy is already running: keep going, and let the completion path save
+    // the terminal state. Reporting a failed start here would invite a resubmit.
+    console.warn(`[agy] failed to persist pid for ${id}: ${error instanceof Error ? error.message : String(error)}`)
+  }
 
   void handle.done
     .then(async (result: RunResult) => {
-      active.delete(id)
       job.state = result.state
       job.exitCode = result.exitCode
       job.endedAt = result.endedAt
@@ -487,6 +507,10 @@ async function startJob(
       } catch (error) {
         console.warn(`[agy] failed to persist job ${id}: ${error instanceof Error ? error.message : String(error)}`)
       }
+      // Released only after the terminal state is on disk: a cancel in this
+      // window would otherwise see a running record with no handle and call
+      // a freshly finished job orphaned.
+      active.delete(id)
       try {
         writeResultFile(job.paths.json, job, result.agy)
       } catch (error) {
@@ -530,40 +554,54 @@ export default {
     if (cached) state.modelIDs = cached.ids
 
     let registered = false
-    let lastRefreshAttempt = 0
+    let lastForcedRefresh = 0
+    let inflightRefresh: Promise<string[]> | null = null
 
     /**
      * Returns the ids it ended up with. `force` bypasses the TTL (a model that
      * was added after the cache was written) but is rate limited so a typo in
-     * `model` cannot spawn `agy models` on every call.
+     * `model` cannot spawn `agy models` on every call. Concurrent callers share
+     * one fetch instead of the second one failing against a stale list.
      */
     const refreshModels = async (force = false, known = cached): Promise<string[]> => {
-      const now = Date.now()
-      if (force && now - lastRefreshAttempt < MODEL_REFRESH_FLOOR_MS) return state.modelIDs
-      lastRefreshAttempt = now
+      if (inflightRefresh) return inflightRefresh
+      if (force && Date.now() - lastForcedRefresh < MODEL_REFRESH_FLOOR_MS) return state.modelIDs
+      if (force) lastForcedRefresh = Date.now()
 
-      const result = await loadModels(ctx.storage, {
-        ttlHours: options.modelCacheTtlHours,
-        cache: known,
-        force,
-        agyBin: resolveAgyPath() ?? undefined,
-      })
-      if (!result.ids.length) {
-        if (result.error) console.warn(`[agy] model list unavailable, model accepts free-form IDs: ${result.error}`)
-        return state.modelIDs
-      }
-
-      const changed = result.ids.join("\n") !== state.modelIDs.join("\n")
-      state.modelIDs = result.ids
-
-      if (changed && registered) {
-        try {
-          await ctx.tool.reload()
-        } catch (error) {
-          console.warn(`[agy] tool reload after model refresh failed: ${error instanceof Error ? error.message : String(error)}`)
+      const pending = (async () => {
+        const result = await loadModels(ctx.storage, {
+          ttlHours: options.modelCacheTtlHours,
+          // A forced call must fall back to the *latest* persisted cache, not
+          // to this setup-time snapshot: otherwise a failed fetch rewinds the
+          // list and hides a model that a later refresh already found.
+          cache: force ? undefined : known,
+          force,
+          agyBin: resolveAgyPath() ?? undefined,
+        })
+        if (!result.ids.length) {
+          if (result.error) console.warn(`[agy] model list unavailable, model accepts free-form IDs: ${result.error}`)
+          return state.modelIDs
         }
+
+        const changed = result.ids.join("\n") !== state.modelIDs.join("\n")
+        state.modelIDs = result.ids
+
+        if (changed && registered) {
+          try {
+            await ctx.tool.reload()
+          } catch (error) {
+            console.warn(`[agy] tool reload after model refresh failed: ${error instanceof Error ? error.message : String(error)}`)
+          }
+        }
+        return state.modelIDs
+      })()
+
+      inflightRefresh = pending
+      try {
+        return await pending
+      } finally {
+        if (inflightRefresh === pending) inflightRefresh = null
       }
-      return state.modelIDs
     }
 
     await ctx.tool.transform((editor: any) => {
@@ -605,7 +643,12 @@ export default {
               )
             }
 
-            entry.handle.kill()
+            const stopped = entry.handle.kill()
+            if (!stopped) {
+              return {
+                content: `agy job ${jobID}\nstate: ${entry.job.state}\ncancel: not applied\n\nThe job is already finishing (or its tree is gone); nothing was killed. Use action=result for the final state.`,
+              }
+            }
             return {
               content: `agy job ${jobID}\ncancel: requested\nstate: cancelled\n\nThe process tree was killed. Use action=result to confirm the final state.`,
             }
@@ -645,6 +688,9 @@ export default {
         }
         if (job.numTurns === undefined && typeof agy.num_turns === "number") {
           job.numTurns = agy.num_turns
+        }
+        if (!job.denied?.length && Array.isArray(agy.denied_actions)) {
+          job.denied = agy.denied_actions.map(formatDenied)
         }
         if (!job.usage) job.usage = mapUsage(agy.usage)
         await notifyJob(ctx, job, typeof agy.response === "string" ? agy.response : "", options)

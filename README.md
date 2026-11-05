@@ -60,7 +60,8 @@ final 64 KB of the file), and all three paths.
 
 `cancel` kills the process tree of a job that is still running in this process and marks it
 `cancelled`. A record that is `running` in storage but has no live handle (left over after a
-reload) is refused rather than pretended away.
+reload) is refused rather than pretended away. A job that is already exiting (or whose timeout is
+being enforced) answers `cancel: not applied` instead of claiming a kill that did not happen.
 
 ### States
 
@@ -161,7 +162,9 @@ AGY_SMOKE_REAL=1 node scripts/smoke.mjs
   Use `conversation` when the exact conversation matters.
 - A reload marks old jobs `orphaned` but does not adopt their child processes; files may keep
   changing after the state says orphaned. Such a job cannot be cancelled.
-- A single stdout larger than 8 MB marks the job `failed`; the log is still complete.
+- A single stdout larger than 8 MB marks the job `failed`; the log is still complete. After a
+  forced settle (the 2 s fallback after a timeout or a cancel), the child can outlive the plugin's
+  stream: the log then misses its last bytes and the exit line says `code=null`.
 - `model` is a free-form string checked at `start`: an unknown ID triggers at most one `agy models`
   refresh per minute, then fails with the known IDs.
 - POSIX process-tree termination is not exercised on this Windows machine.
