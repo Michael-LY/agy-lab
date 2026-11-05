@@ -4,10 +4,27 @@
 // under Node's type stripping.
 
 import { spawn, spawnSync } from "node:child_process"
-import { createWriteStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import {
+  closeSync,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  statSync,
+  writeFileSync,
+} from "node:fs"
 import { delimiter, join } from "node:path"
 
-export type JobState = "running" | "done" | "degraded" | "failed" | "timed_out" | "orphaned"
+export type JobState =
+  | "running"
+  | "done"
+  | "degraded"
+  | "failed"
+  | "timed_out"
+  | "cancelled"
+  | "orphaned"
 
 export type JobPaths = {
   log: string
@@ -75,6 +92,13 @@ export type RunHandle = {
 
 const MAX_STDOUT_BYTES = 8 * 1024 * 1024
 const MAX_STDERR_BYTES = 1 * 1024 * 1024
+/** How much of the log tail `readTail` loads; a status call must stay O(1). */
+const TAIL_BYTES = 64 * 1024
+
+/** Lines the runner appends itself, so `status` is not empty while agy is quiet. */
+export function heartbeat(line: string): string {
+  return `[agy-runner] ${line}`
+}
 
 export function stripAnsi(text: string): string {
   return text.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
@@ -262,6 +286,12 @@ export function runJob(input: RunInput): RunHandle {
     }
   }
 
+  // A single line at each edge of the run. agy's json output arrives in one
+  // burst at exit, so without this `status` shows an empty log for minutes.
+  logStream.write(
+    `${heartbeat(`started pid=${child.pid ?? "unknown"} at ${new Date(startedAt).toISOString()}`)}\n`
+  )
+
   const stdoutChunks: Buffer[] = []
   const stderrChunks: Buffer[] = []
   let stdoutBytes = 0
@@ -270,12 +300,16 @@ export function runJob(input: RunInput): RunHandle {
   let stderrOverflow = false
 
   let timedOut = false
+  let cancelled = false
   let settled = false
   let exitCode: number | null = null
   let spawnError: Error | null = null
 
   const finish = async (): Promise<RunResult> => {
     const endedAt = Date.now()
+    logStream.write(
+      `${heartbeat(`exit code=${exitCode ?? "null"} duration=${endedAt - startedAt}ms`)}\n`
+    )
     await endStream(logStream)
     await endStream(errStream)
 
@@ -307,6 +341,9 @@ export function runJob(input: RunInput): RunHandle {
 
     if (spawnError) {
       error = `failed to start agy: ${spawnError.message}`
+    } else if (cancelled) {
+      state = "cancelled"
+      error = "cancelled by the caller; process tree killed"
     } else if (timedOut) {
       state = "timed_out"
       error = `timed out after ${Math.round(timeoutMs / 1000)}s; process tree killed`
@@ -439,22 +476,50 @@ export function runJob(input: RunInput): RunHandle {
     pid: child.pid ?? null,
     done,
     kill: () => {
-      timedOut = true
+      if (settled) return
+      cancelled = true
+      clearTimeout(timer)
+      clearTimeout(killTimer)
       killTree(child.pid ?? 0)
+      // Same guard as the timeout path: resolve even if taskkill is ignored.
+      killTimer = setTimeout(() => settle(), 2000)
     },
   }
 }
 
-/** Last N non-empty lines of a log file, for `action=status`. */
-export function readTail(path: string, lines = 20): string {
+/**
+ * Last N non-empty lines of a log file, for `action=status`. Only the final
+ * `maxBytes` of the file are read: a status call must not load an 8 MB log.
+ */
+export function readTail(path: string, lines = 20, maxBytes = TAIL_BYTES): string {
+  let text: string
   try {
-    const text = readFileSync(path, "utf8")
-    const all = text.split(/\r?\n/)
-    while (all.length && all[all.length - 1] === "") all.pop()
-    return all.slice(-lines).join("\n")
+    const size = statSync(path).size
+    const start = Math.max(0, size - maxBytes)
+    const length = size - start
+    if (length <= 0) return ""
+
+    const buffer = Buffer.allocUnsafe(length)
+    const fd = openSync(path, "r")
+    try {
+      readSync(fd, buffer, 0, length, start)
+    } finally {
+      closeSync(fd)
+    }
+
+    text = buffer.toString("utf8")
+    // When the window starts mid-file, the first line is a fragment: drop it.
+    if (start > 0) {
+      const newline = text.indexOf("\n")
+      text = newline < 0 ? "" : text.slice(newline + 1)
+    }
   } catch {
     return ""
   }
+
+  const all = text.split(/\r?\n/)
+  while (all.length && all[all.length - 1] === "") all.pop()
+  return all.slice(-lines).join("\n")
 }
 
 /** Reads a result file produced by writeResultFile, or null when absent/broken. */

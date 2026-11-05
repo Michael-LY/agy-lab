@@ -34,10 +34,10 @@ Use `action=status` to poll and `action=result` to read the outcome.
 
 | Parameter | Type | Meaning |
 |---|---|---|
-| `action` | `start` \| `status` \| `result`, default `start` | Dispatch |
+| `action` | `start` \| `status` \| `result` \| `cancel`, default `start` | Dispatch |
 | `prompt` | string, required for `start` | Passed to agy unchanged (`-p`) |
-| `jobID` | string, required for `status`/`result` | ID returned by `start` |
-| `model` | enum when a model cache exists, else string | Omitted: `options.defaultModel`, then agy's default |
+| `jobID` | string, required for `status`/`result`/`cancel` | ID returned by `start` |
+| `model` | string | Free-form ID from `agy models`; an unknown ID triggers one throttled refresh, then an error. Omitted: `options.defaultModel`, then agy's default |
 | `mode` | `plan` \| `accept-edits` \| `auto` | Defaults to `options.defaultMode` (`plan`) |
 | `effort` | `low` \| `medium` \| `high` \| `xhigh` \| `max` | Optional `--effort` |
 | `conversation` | string | Resume an exact agy conversation (`--conversation`) |
@@ -48,23 +48,29 @@ what done looks like.
 
 Results are written to `.agy-out/` (configurable):
 
-- `<jobID>.log` — stdout streamed while agy runs
+- `<jobID>.log` — stdout, plus two `[agy-runner]` edge lines (`started pid=…`, `exit code=… duration=…ms`). agy's json output arrives in one burst at exit, so those lines are what make `status` useful while a job runs.
 - `<jobID>.err` — stderr
 - `<jobID>.json` — `{ job, agy }`, pretty-printed; `agy` is the raw CLI JSON
 
 `result` returns the state, duration, `conversation_id`, `num_turns`, token usage (input / output /
 thinking / cache_read / total), denied actions, and the first 4000 characters of the response. A
 `degraded` job (empty response, usually denied actions) also suggests retrying with `mode=plan`.
-`status` returns the state, elapsed time, mode/model, the last 20 log lines, and all three paths.
+`status` returns the state, elapsed time, mode/model, the last 20 log lines (read from only the
+final 64 KB of the file), and all three paths.
+
+`cancel` kills the process tree of a job that is still running in this process and marks it
+`cancelled`. A record that is `running` in storage but has no live handle (left over after a
+reload) is refused rather than pretended away.
 
 ### States
 
-`running → done | degraded | failed | timed_out | orphaned`
+`running → done | degraded | failed | timed_out | cancelled | orphaned`
 
 - `done`: exit 0, valid JSON, `status=SUCCESS`, non-empty response.
 - `degraded`: exit 0 but the response is empty (denied actions are called out).
 - `failed`: non-zero exit, invalid JSON, or a non-`SUCCESS` status; the error carries the tail.
 - `timed_out`: `--print-timeout` fired, or the plugin hard-killed the process tree.
+- `cancelled`: `action=cancel` killed the process tree.
 - `orphaned`: the plugin reloaded while the job was running. If `<jobID>.json` already holds a
   terminal state, that state is restored instead.
 
@@ -86,7 +92,8 @@ deleted by the plugin.
         "maxConcurrent": 2,
         "timeoutMinutes": 10,
         "outputDir": ".agy-out",
-        "modelCacheTtlHours": 24
+        "modelCacheTtlHours": 24,
+        "notifyOnComplete": true
       }
     }
   ]
@@ -97,6 +104,11 @@ deleted by the plugin.
 agy choose. Non-`plan` modes call `ctx.permission.assert` first; if permission is denied, no job is
 created.
 
+`notifyOnComplete: false` turns off the synthetic wake-up: the job still records its state and
+writes its files, but nothing is delivered to the session, so poll `status` instead. Useful for
+batch work where one wake-up per job costs more than the job itself. The record is still marked
+`notified` so a reload does not deliver it later.
+
 ## Verification
 
 Offline smoke test (fake agy, no quota):
@@ -105,9 +117,10 @@ Offline smoke test (fake agy, no quota):
 node scripts/smoke.mjs
 ```
 
-It covers `done`, `degraded`, `timed_out` (and confirms the process is really dead), `failed` for a
-non-zero exit / invalid JSON / bad status, argv mapping including `conversation` vs `continue`,
-model parsing, job retention, and orphan reconciliation.
+It covers `done`, `degraded`, `timed_out` and `cancelled` (both confirming the process is really
+dead), `failed` for a non-zero exit / invalid JSON / bad status, argv mapping including
+`conversation` vs `continue`, model parsing, the tail-only log read, job retention, orphan
+reconciliation, the notification metadata, the silent mode, and the cancel refusals.
 
 One real agy turn, when you want to spend quota:
 
@@ -119,16 +132,21 @@ AGY_SMOKE_REAL=1 node scripts/smoke.mjs
 
 1. Call the tool once: `agy` appears in the tool list, and the server log has a single
    `[agy] setup` line (no duplicate load).
-2. `mode=plan`: `start` → `status` → `result`; `.agy-out/` contains the log, err, and JSON files.
+2. `mode=plan`: `start` → `status` → `result`; `.agy-out/` contains the log, err, and JSON files,
+   and `status` shows the `[agy-runner] started pid=…` line while the job is still running.
 3. `mode=accept-edits`: a permission prompt appears; rejecting it produces no job.
 4. `continue` and `conversation` each resume the previous agy conversation.
-5. Start a long job, then `opencode service restart`: after reload the job is `orphaned`.
-6. Let a job finish while idle: with no input, the model is woken by the synthetic message and can
-   read the result.
-7. Start offline: the cached model list is used, or `model` degrades to a free string; the tool
+5. Start a long job, then `action=cancel`: the job ends `cancelled` and its process is gone.
+6. Start a long job, then `opencode service restart`: after reload the job is `orphaned`, and
+   `cancel` refuses it.
+7. Let a job finish while idle: with no input, the model is woken by the synthetic message, which
+   carries `conversation_id` and usage.
+8. Set `notifyOnComplete: false` and let a job finish: no synthetic message arrives, and `status`
+   is the way to read it.
+9. Start offline: the cached model list is used, or `model` degrades to a free string; the tool
    still works.
-8. Start three jobs with `maxConcurrent: 2`: the third fails immediately and lists the running
-   jobIDs.
+10. Start three jobs with `maxConcurrent: 2`: the third fails immediately and lists the running
+    jobIDs.
 
 ### Known limits
 
@@ -138,19 +156,19 @@ AGY_SMOKE_REAL=1 node scripts/smoke.mjs
 - `ctx.storage` is treated as plugin-global. If it is actually location-scoped, the 50-job cap
   becomes per-location, which the plan accepts.
 - Every completion synthetic triggers one real model turn. Do not automatically resubmit the same
-  task after a completion; the notification says so too.
+  task after a completion; the notification says so too. Set `notifyOnComplete: false` to opt out.
 - `continue` targets agy's globally most recent conversation, which may belong to another repo.
   Use `conversation` when the exact conversation matters.
 - A reload marks old jobs `orphaned` but does not adopt their child processes; files may keep
-  changing after the state says orphaned.
+  changing after the state says orphaned. Such a job cannot be cancelled.
 - A single stdout larger than 8 MB marks the job `failed`; the log is still complete.
-- The model enum is a hard check; a model added within the TTL is rejected until the cache refreshes
-  or OpenCode restarts.
+- `model` is a free-form string checked at `start`: an unknown ID triggers at most one `agy models`
+  refresh per minute, then fails with the known IDs.
 - POSIX process-tree termination is not exercised on this Windows machine.
 - The plugin shows nothing about Antigravity quota; failures surface as agy errors.
 
-Out of scope for v1: subagents, `/agy` command, cancellation, queueing, `jsonSchema`, `addDir` /
-`directory` overrides, `agent` / `sandbox` passthrough, TUI panels, quota display.
+Out of scope for v1: subagents, `/agy` command, queueing, `jsonSchema`, `addDir` / `directory`
+overrides, `agent` / `sandbox` passthrough, TUI panels, quota display.
 
 ## Layout
 

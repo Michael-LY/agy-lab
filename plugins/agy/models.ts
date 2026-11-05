@@ -112,13 +112,17 @@ export async function loadModels(
     agyBin?: string
     env?: Record<string, string | undefined>
     now?: number
+    /** A cache the caller already read; avoids a second storage round trip. */
+    cache?: ModelsCache | null
+    /** Skip the fresh-cache shortcut and always ask agy. */
+    force?: boolean
   } = {}
 ): Promise<ModelsResult> {
   const now = options.now ?? Date.now()
   const ttlHours = options.ttlHours ?? 24
-  const cache = await readModelsCache(storage)
+  const cache = options.cache !== undefined ? options.cache : await readModelsCache(storage)
 
-  if (cache && !isModelsCacheStale(cache, ttlHours, now)) {
+  if (!options.force && cache && !isModelsCacheStale(cache, ttlHours, now)) {
     return { ids: cache.ids, fetchedAt: cache.fetchedAt, source: "cache", stale: false }
   }
 
