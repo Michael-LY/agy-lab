@@ -1,0 +1,27 @@
+# deps
+node_modules/
+.pnp.*
+vendor/
+
+# build output
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# env & secrets
+.env
+.env.*
+!.env.example
+
+# editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# scratch
+tmp/
+.agy-out/
+*.log
